@@ -153,7 +153,6 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Пожалуйста, отвечай ГОЛОСОМ. Нажми /repeat для текущего вопроса.")
-
 # ---------- Entry ----------
 def main():
     missing = [k for k, v in {
@@ -165,6 +164,14 @@ def main():
         raise SystemExit(f"Нет переменных: {', '.join(missing)}")
 
     app = Application.builder().token(BOT_TOKEN).build()
+
+    # ЛОГ: кто наш бот
+    async def on_startup(app):
+        me = await app.bot.get_me()
+        logging.info(f"Бот запущен как @{me.username} (id={me.id})")
+        # на всякий случай явно отключим вебхук и сбросим «висящие» апдейты
+        await app.bot.delete_webhook(drop_pending_updates=True)
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("next", next_cmd))
@@ -172,8 +179,15 @@ def main():
     app.add_handler(MessageHandler(filters.VOICE, voice_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
-    logging.info("Бот запущен. Ожидаю сообщения…")
-    app.run_polling()
+    logging.info("Бот запускается…")
+    app.run_polling(
+        allowed_updates=None,              # получаем все типы
+        close_loop=False,
+        stop_signals=None,
+        on_startup=on_startup,             # лог + delete_webhook
+        drop_pending_updates=True          # выкинуть старые «зависшие» апдейты
+    )
 
 if __name__ == "__main__":
     main()
+
