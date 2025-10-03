@@ -1,57 +1,49 @@
-# bot_gsheets.py
-# Голосовые ответы -> транскрипция OpenAI -> запись в Google Sheets (Render/облако, без service.json на диске)
+# bot_webhook.py
+# Вебхук-бот: FastAPI + PTB 21.6 + OpenAI + Google Sheets (SERVICE_ACCOUNT_JSON)
 
-import os, time, tempfile, logging, json
+import os, time, json, logging, tempfile
 from pathlib import Path
+from typing import Any, Dict
 
 from dotenv import load_dotenv
-load_dotenv()  # локально читает .env; в облаке берёт из Variables
+load_dotenv()
 
 import gspread
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import PlainTextResponse
+import uvicorn
+
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 from openai import OpenAI
 
-# ---------- ENV ----------
+# ----------------- ENV -----------------
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-transcribe")
 GSHEET_ID = os.getenv("GSHEET_ID")
+SERVICE_ACCOUNT_JSON = os.getenv("SERVICE_ACCOUNT_JSON")  # содержимое JSON ключа
+WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "supersecret123")  # задайте в Render
+PUBLIC_URL = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("PUBLIC_URL")  # Render даёт RENDER_EXTERNAL_URL
+PORT = int(os.getenv("PORT", "8000"))
 
-# ключ сервис-аккаунта как ТЕКСТ JSON (переменная окружения)
-SERVICE_ACCOUNT_JSON = os.getenv("SERVICE_ACCOUNT_JSON")
-# (опционально) путь к файлу для локального запуска
-SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE", "service.json")
-
-# ---------- LOGGING ----------
+# ----------------- LOG -----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-# ---------- OpenAI ----------
-if not OPENAI_API_KEY:
-    raise SystemExit("Нет OPENAI_API_KEY. Задай переменную окружения.")
+# ----------------- Clients -----------------
+if not (BOT_TOKEN and OPENAI_API_KEY and GSHEET_ID):
+    raise SystemExit("Нужны TELEGRAM_TOKEN, OPENAI_API_KEY, GSHEET_ID.")
+
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ---------- ВОПРОСЫ ----------
-QUESTIONS = [
-    "Кто ты из Гарри Поттера?",
-    "Почему небо голубое?",
-    "Сколько времени нужно, чтобы дойти пешком 5 км в гору ночью?"
-]
-MAIN_KB = ReplyKeyboardMarkup([["/next", "/repeat", "/help"]], resize_keyboard=True)
-user_state: dict[int, dict] = {}
-
-# ---------- Google Sheets ----------
 def gspread_client():
-    """Создаём gspread-клиент: приоритетно из SERVICE_ACCOUNT_JSON, иначе из файла."""
-    if SERVICE_ACCOUNT_JSON:
-        try:
-            creds_dict = json.loads(SERVICE_ACCOUNT_JSON)
-        except json.JSONDecodeError as e:
-            raise SystemExit(f"SERVICE_ACCOUNT_JSON не валиден: {e}")
-        return gspread.service_account_from_dict(creds_dict)
-    if Path(SERVICE_ACCOUNT_FILE).exists():
-        return gspread.service_account(filename=SERVICE_ACCOUNT_FILE)
-    raise SystemExit("Нет SERVICE_ACCOUNT_JSON и нет файла service.json. Задай один из вариантов.")
+    if not SERVICE_ACCOUNT_JSON:
+        raise SystemExit("Задайте SERVICE_ACCOUNT_JSON (полный текст service.json).")
+    try:
+        creds_dict = json.loads(SERVICE_ACCOUNT_JSON)
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"Некорректный SERVICE_ACCOUNT_JSON: {e}")
+    return gspread.service_account_from_dict(creds_dict)
 
 def open_sheet():
     gc = gspread_client()
@@ -63,10 +55,21 @@ def open_sheet():
         ws.append_row(["timestamp", "user_id", "username", "q_index", "question", "transcript"])
     return ws
 
-# ---------- Handlers ----------
+# ----------------- Q&A -----------------
+QUESTIONS = [
+    "Кто ты из Гарри Поттера?",
+    "Почему небо голубое?",
+    "Сколько времени нужно, чтобы дойти пешком 5 км в гору ночью?",
+]
+MAIN_KB = ReplyKeyboardMarkup([["/next", "/repeat", "/help"]], resize_keyboard=True)
+user_state: Dict[int, Dict[str, Any]] = {}
+
+# ----------------- PTB Application -----------------
+app_tg = Application.builder().token(BOT_TOKEN).build()
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_state[user_id] = {"i": 0}
+    uid = update.effective_user.id
+    user_state[uid] = {"i": 0}
     greet = ("Привет! Сейчас я задам тебе несколько важных вопросов — не думай, отвечай душой! "
              "Запиши голосовое сообщение — это важно!")
     await update.message.reply_text(greet, reply_markup=MAIN_KB)
@@ -76,8 +79,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Отвечай ГОЛОСОМ. /repeat — повторить вопрос, /next — следующий.")
 
 async def ask_current(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    i = user_state.get(user_id, {"i": 0})["i"]
+    uid = update.effective_user.id
+    i = user_state.get(uid, {"i": 0})["i"]
     if i >= len(QUESTIONS):
         await update.message.reply_text("Вопросы закончились. Спасибо! Набери /start, чтобы пройти заново.")
         return
@@ -86,8 +89,8 @@ async def ask_current(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def next_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    st = user_state.setdefault(user_id, {"i": 0})
+    uid = update.effective_user.id
+    st = user_state.setdefault(uid, {"i": 0})
     if st["i"] < len(QUESTIONS) - 1:
         st["i"] += 1
     await ask_current(update, context)
@@ -97,19 +100,20 @@ async def repeat_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    user_id = user.id
-    st = user_state.setdefault(user_id, {"i": 0})
+    uid = user.id
+    st = user_state.setdefault(uid, {"i": 0})
     i = st["i"]
 
     if i >= len(QUESTIONS):
         await update.message.reply_text("Серия завершена. Набери /start, чтобы начать заново.")
         return
 
-    # Скачать голос и расшифровать
+    # Скачиваем голос и шифруем
     try:
         vfile = await update.message.voice.get_file()
+        # Telegram отдаёт OGG/Opus — OpenAI нормально ест
         with tempfile.TemporaryDirectory() as tmpd:
-            ogg_path = Path(tmpd) / f"voice_{user_id}_{int(time.time())}.ogg"
+            ogg_path = Path(tmpd) / f"voice_{uid}_{int(time.time())}.ogg"
             await vfile.download_to_drive(ogg_path.as_posix())
             with open(ogg_path, "rb") as audio:
                 tr = client.audio.transcriptions.create(
@@ -123,13 +127,13 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Не удалось расшифровать голос: {e}")
         return
 
-    # Записать в Google Sheets
+    # Записываем в таблицу
     try:
         ws = open_sheet()
         username = user.username or f"{user.first_name or ''} {user.last_name or ''}".strip()
         ws.append_row([
             time.strftime("%Y-%m-%d %H:%M:%S"),
-            str(user_id),
+            str(uid),
             username,
             str(i),
             QUESTIONS[i],
@@ -143,7 +147,6 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"✅ Получил и записал ответ.\nТекст: {transcript[:400] + ('…' if len(transcript)>400 else '')}"
     )
-
     if st["i"] < len(QUESTIONS) - 1:
         st["i"] += 1
         await ask_current(update, context)
@@ -152,37 +155,52 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Пожалуйста, отвечай ГОЛОСОМ. Нажми /repeat для текущего вопроса.")
-# ---------- Entry ----------
-def main():
-    missing = [k for k, v in {
-        "TELEGRAM_TOKEN": BOT_TOKEN,
-        "OPENAI_API_KEY": OPENAI_API_KEY,
-        "GSHEET_ID": GSHEET_ID,
-    }.items() if not v]
-    if missing:
-        raise SystemExit(f"Нет переменных: {', '.join(missing)}")
 
-    # 1) Перед запуском polling убьём вебхук синхронно (без asyncio)
-    try:
-        import requests
-        r = requests.get(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook",
-            params={"drop_pending_updates": "true"},
-            timeout=10,
-        )
-        logging.info("deleteWebhook: %s", r.status_code)
-    except Exception as e:
-        logging.warning("deleteWebhook failed: %s", e)
+# Регистрация хэндлеров
+app_tg.add_handler(CommandHandler("start", start))
+app_tg.add_handler(CommandHandler("help", help_cmd))
+app_tg.add_handler(CommandHandler("next", next_cmd))
+app_tg.add_handler(CommandHandler("repeat", repeat_cmd))
+app_tg.add_handler(MessageHandler(filters.VOICE, voice_handler))
+app_tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
-    # 2) Строим приложение и регистрируем хэндлеры
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("next", next_cmd))
-    app.add_handler(CommandHandler("repeat", repeat_cmd))
-    app.add_handler(MessageHandler(filters.VOICE, voice_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+# ----------------- FastAPI -----------------
+api = FastAPI()
 
-    logging.info("Бот запускается…")
-    # 3) Никаких дополнительных аргументов — пусть PTB сам создаст event loop
-    app.run_polling()
+@api.get("/", response_class=PlainTextResponse)
+async def health():
+    return "ok"
+
+@api.post(f"/webhook/{WEBHOOK_SECRET}")
+async def telegram_webhook(request: Request):
+    data = await request.json()
+    # Преобразуем апдейт и передаём в PTB
+    update = Update.de_json(data, app_tg.bot)
+    await app_tg.process_update(update)
+    return {"ok": True}
+
+@api.on_event("startup")
+async def setup_webhook():
+    # Сбросить возможный старый вебхук + поставить новый
+    from httpx import AsyncClient
+    base_url = PUBLIC_URL
+    if not base_url:
+        logging.warning("PUBLIC_URL не задан (RENDER_EXTERNAL_URL). Вебхук не будет установлен автоматически.")
+        return
+
+    webhook_url = f"{base_url}/webhook/{WEBHOOK_SECRET}"
+    logging.info("Устанавливаю webhook -> %s", webhook_url)
+
+    async with AsyncClient(timeout=10) as http:
+        # удаляем старый
+        await http.get(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook",
+                       params={"drop_pending_updates": "true"})
+        # ставим новый
+        r = await http.get(f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook",
+                           params={"url": webhook_url, "secret_token": WEBHOOK_SECRET})
+        logging.info("setWebhook status=%s, body=%s", r.status_code, r.text)
+
+# ----------------- Local run -----------------
+if __name__ == "__main__":
+    # локально: uvicorn + /webhook
+    uvicorn.run("bot_webhook:api", host="0.0.0.0", port=PORT, reload=False)
