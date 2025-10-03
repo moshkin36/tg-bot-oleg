@@ -1,45 +1,61 @@
 # bot_gsheets.py
-# Телеграм-бот: задаёт вопросы, принимает голос, расшифровывает в OpenAI и пишет в Google Sheets.
+# Голосовые ответы -> транскрипция OpenAI -> запись в Google Sheets (без service.json на диске)
 
-import os, time, tempfile, logging
+import os, time, tempfile, logging, json
 from pathlib import Path
 
 from dotenv import load_dotenv
-load_dotenv()  # читает .env из текущей папки
+load_dotenv()  # локально читает .env; на Render берёт из Variables
 
 import gspread
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 from openai import OpenAI
 
-# === Настройки из .env ===
+# ---------- ENV ----------
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-transcribe")
 GSHEET_ID = os.getenv("GSHEET_ID")
+
+# ключ сервис-аккаунта как ТЕКСТ JSON (вставляется в переменную окружения)
+SERVICE_ACCOUNT_JSON = os.getenv("SERVICE_ACCOUNT_JSON")
+# (опционально) путь к файлу — на всякий случай, если запускаешь локально со старым вариантом
 SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE", "service.json")
 
-# === Логи ===
+# ---------- LOGGING ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-# === Клиент OpenAI ===
+# ---------- OpenAI ----------
+if not OPENAI_API_KEY:
+    raise SystemExit("Нет OPENAI_API_KEY. Задай переменную окружения.")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# === Вопросы ===
+# ---------- ВОПРОСЫ ----------
 QUESTIONS = [
     "Кто ты из Гарри Поттера?",
     "Почему небо голубое?",
     "Сколько времени нужно, чтобы дойти пешком 5 км в гору ночью?"
 ]
-
 MAIN_KB = ReplyKeyboardMarkup([["/next", "/repeat", "/help"]], resize_keyboard=True)
+user_state = {}  # user_id -> {"i": int}
 
-# простая память в ОЗУ: user_id -> {"i": int текущего вопроса}
-user_state = {}
+# ---------- Google Sheets ----------
+def gspread_client():
+    """Создаём gspread-клиент: приоритетно из SERVICE_ACCOUNT_JSON, иначе из файла."""
+    if SERVICE_ACCOUNT_JSON:
+        try:
+            creds_dict = json.loads(SERVICE_ACCOUNT_JSON)
+        except json.JSONDecodeError as e:
+            raise SystemExit(f"SERVICE_ACCOUNT_JSON не валиден: {e}")
+        return gspread.service_account_from_dict(creds_dict)
+    # fallback для локального запуска с файлом
+    if Path(SERVICE_ACCOUNT_FILE).exists():
+        return gspread.service_account(filename=SERVICE_ACCOUNT_FILE)
+    raise SystemExit("Не найден ни SERVICE_ACCOUNT_JSON, ни файл service.json. Задай один из вариантов.")
 
-# === Работа с Google Sheets ===
 def open_sheet():
-    gc = gspread.service_account(filename=SERVICE_ACCOUNT_FILE)
+    gc = gspread_client()
     sh = gc.open_by_key(GSHEET_ID)
     try:
         ws = sh.worksheet("answers")
@@ -48,7 +64,7 @@ def open_sheet():
         ws.append_row(["timestamp", "user_id", "username", "q_index", "question", "transcript"])
     return ws
 
-# === Хэндлеры ===
+# ---------- Handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_state[user_id] = {"i": 0}
@@ -62,8 +78,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def ask_current(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    st = user_state.get(user_id, {"i": 0})
-    i = st["i"]
+    i = user_state.get(user_id, {"i": 0})["i"]
     if i >= len(QUESTIONS):
         await update.message.reply_text("Вопросы закончились. Спасибо! Набери /start, чтобы пройти заново.")
         return
@@ -91,14 +106,12 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Серия завершена. Набери /start, чтобы начать заново.")
         return
 
+    # Скачать голос и расшифровать
     try:
-        # скачиваем голос
         vfile = await update.message.voice.get_file()
         with tempfile.TemporaryDirectory() as tmpd:
             ogg_path = Path(tmpd) / f"voice_{user_id}_{int(time.time())}.ogg"
             await vfile.download_to_drive(ogg_path.as_posix())
-
-            # транскрипция
             with open(ogg_path, "rb") as audio:
                 tr = client.audio.transcriptions.create(
                     model=OPENAI_MODEL,
@@ -111,7 +124,7 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Не удалось расшифровать голос: {e}")
         return
 
-    # запись в таблицу
+    # Записать в Google Sheets
     try:
         ws = open_sheet()
         username = user.username or f"{user.first_name or ''} {user.last_name or ''}".strip()
@@ -132,30 +145,24 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Получил и записал ответ.\nТекст: {transcript[:400] + ('…' if len(transcript)>400 else '')}"
     )
 
-    # следующий вопрос / финал
     if st["i"] < len(QUESTIONS) - 1:
         st["i"] += 1
         await ask_current(update, context)
     else:
-        await update.message.reply_text("🎉 Это был последний вопрос. Данные в листе «answers» обновлены.")
+        await update.message.reply_text("🎉 Это был последний вопрос. Лист «answers» обновлён.")
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Пожалуйста, отвечай ГОЛОСОМ. Нажми /repeat для текущего вопроса.")
 
-# === Точка входа ===
+# ---------- Entry ----------
 def main():
-    # быстрый чек окружения
     missing = [k for k, v in {
         "TELEGRAM_TOKEN": BOT_TOKEN,
         "OPENAI_API_KEY": OPENAI_API_KEY,
         "GSHEET_ID": GSHEET_ID,
-        "SERVICE_ACCOUNT_FILE": SERVICE_ACCOUNT_FILE,
     }.items() if not v]
     if missing:
-        raise SystemExit(f"Отсутствуют переменные в .env: {', '.join(missing)}")
-
-    if not Path(SERVICE_ACCOUNT_FILE).exists():
-        raise SystemExit(f"Файл сервис-аккаунта не найден: {SERVICE_ACCOUNT_FILE}")
+        raise SystemExit(f"Нет переменных: {', '.join(missing)}")
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
