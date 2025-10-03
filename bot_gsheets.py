@@ -162,17 +162,20 @@ def main():
     if missing:
         raise SystemExit(f"Нет переменных: {', '.join(missing)}")
 
+    # 1) Перед запуском polling убьём вебхук синхронно (без asyncio)
+    try:
+        import requests
+        r = requests.get(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook",
+            params={"drop_pending_updates": "true"},
+            timeout=10,
+        )
+        logging.info("deleteWebhook: %s", r.status_code)
+    except Exception as e:
+        logging.warning("deleteWebhook failed: %s", e)
+
+    # 2) Строим приложение и регистрируем хэндлеры
     app = Application.builder().token(BOT_TOKEN).build()
-
-    # заранее (до запуска polling) отключим webhook и выведем getMe
-    import asyncio
-    async def _startup():
-        await app.bot.delete_webhook(drop_pending_updates=True)
-        me = await app.bot.get_me()
-        logging.info(f"Бот запущен как @{me.username} (id={me.id})")
-
-    asyncio.run(_startup())
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("next", next_cmd))
@@ -181,12 +184,5 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
     logging.info("Бот запускается…")
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,   # на всякий случай
-        close_loop=False,
-        stop_signals=None,
-    )
-
-if __name__ == "__main__":
-    main()
+    # 3) Никаких дополнительных аргументов — пусть PTB сам создаст event loop
+    app.run_polling()
