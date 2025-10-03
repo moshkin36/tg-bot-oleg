@@ -152,7 +152,6 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Пожалуйста, отвечай ГОЛОСОМ. Нажми /repeat для текущего вопроса.")
-
 # ---------- Entry ----------
 def main():
     missing = [k for k, v in {
@@ -165,11 +164,14 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    async def post_init(application):
-        me = await application.bot.get_me()
+    # заранее (до запуска polling) отключим webhook и выведем getMe
+    import asyncio
+    async def _startup():
+        await app.bot.delete_webhook(drop_pending_updates=True)
+        me = await app.bot.get_me()
         logging.info(f"Бот запущен как @{me.username} (id={me.id})")
-        # жёстко переключаемся на polling и очищаем старые апдейты
-        await application.bot.delete_webhook(drop_pending_updates=True)
+
+    asyncio.run(_startup())
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
@@ -181,8 +183,7 @@ def main():
     logging.info("Бот запускается…")
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
-        post_init=post_init,
-        drop_pending_updates=True,
+        drop_pending_updates=True,   # на всякий случай
         close_loop=False,
         stop_signals=None,
     )
