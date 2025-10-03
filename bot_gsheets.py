@@ -1,11 +1,11 @@
 # bot_gsheets.py
-# Голосовые ответы -> транскрипция OpenAI -> запись в Google Sheets (без service.json на диске)
+# Голосовые ответы -> транскрипция OpenAI -> запись в Google Sheets (Render/облако, без service.json на диске)
 
 import os, time, tempfile, logging, json
 from pathlib import Path
 
 from dotenv import load_dotenv
-load_dotenv()  # локально читает .env; на Render берёт из Variables
+load_dotenv()  # локально читает .env; в облаке берёт из Variables
 
 import gspread
 from telegram import Update, ReplyKeyboardMarkup
@@ -18,9 +18,9 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-transcribe")
 GSHEET_ID = os.getenv("GSHEET_ID")
 
-# ключ сервис-аккаунта как ТЕКСТ JSON (вставляется в переменную окружения)
+# ключ сервис-аккаунта как ТЕКСТ JSON (переменная окружения)
 SERVICE_ACCOUNT_JSON = os.getenv("SERVICE_ACCOUNT_JSON")
-# (опционально) путь к файлу — на всякий случай, если запускаешь локально со старым вариантом
+# (опционально) путь к файлу для локального запуска
 SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE", "service.json")
 
 # ---------- LOGGING ----------
@@ -38,7 +38,7 @@ QUESTIONS = [
     "Сколько времени нужно, чтобы дойти пешком 5 км в гору ночью?"
 ]
 MAIN_KB = ReplyKeyboardMarkup([["/next", "/repeat", "/help"]], resize_keyboard=True)
-user_state = {}  # user_id -> {"i": int}
+user_state: dict[int, dict] = {}
 
 # ---------- Google Sheets ----------
 def gspread_client():
@@ -49,10 +49,9 @@ def gspread_client():
         except json.JSONDecodeError as e:
             raise SystemExit(f"SERVICE_ACCOUNT_JSON не валиден: {e}")
         return gspread.service_account_from_dict(creds_dict)
-    # fallback для локального запуска с файлом
     if Path(SERVICE_ACCOUNT_FILE).exists():
         return gspread.service_account(filename=SERVICE_ACCOUNT_FILE)
-    raise SystemExit("Не найден ни SERVICE_ACCOUNT_JSON, ни файл service.json. Задай один из вариантов.")
+    raise SystemExit("Нет SERVICE_ACCOUNT_JSON и нет файла service.json. Задай один из вариантов.")
 
 def open_sheet():
     gc = gspread_client()
@@ -153,6 +152,7 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Пожалуйста, отвечай ГОЛОСОМ. Нажми /repeat для текущего вопроса.")
+
 # ---------- Entry ----------
 def main():
     missing = [k for k, v in {
@@ -165,12 +165,11 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # ЛОГ: кто наш бот
-    async def on_startup(app):
-        me = await app.bot.get_me()
+    async def post_init(application):
+        me = await application.bot.get_me()
         logging.info(f"Бот запущен как @{me.username} (id={me.id})")
-        # на всякий случай явно отключим вебхук и сбросим «висящие» апдейты
-        await app.bot.delete_webhook(drop_pending_updates=True)
+        # жёстко переключаемся на polling и очищаем старые апдейты
+        await application.bot.delete_webhook(drop_pending_updates=True)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
@@ -181,13 +180,12 @@ def main():
 
     logging.info("Бот запускается…")
     app.run_polling(
-        allowed_updates=None,              # получаем все типы
+        allowed_updates=Update.ALL_TYPES,
+        post_init=post_init,
+        drop_pending_updates=True,
         close_loop=False,
         stop_signals=None,
-        on_startup=on_startup,             # лог + delete_webhook
-        drop_pending_updates=True          # выкинуть старые «зависшие» апдейты
     )
 
 if __name__ == "__main__":
     main()
-
